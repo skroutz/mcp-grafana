@@ -725,10 +725,14 @@ func NewAuthRoundTripper(rt http.RoundTripper, accessToken, idToken, apiKey stri
 // sensitiveHeaders lists HTTP header names whose values must be redacted in
 // debug logs to prevent credential leakage (see #919).
 var sensitiveHeaders = map[string]bool{
-	"Authorization":  true,
-	"X-Access-Token": true,
-	"X-Grafana-Id":   true,
-	"Cookie":         true,
+	"Authorization":           true,
+	"X-Access-Token":          true,
+	"X-Grafana-Id":            true,
+	"Cookie":                  true,
+	"Cf-Access-Jwt-Assertion": true,
+	"Cf-Access-Token":         true,
+	"Cf-Access-Client-Id":     true,
+	"Cf-Access-Client-Secret": true,
 }
 
 // redactHeaderValue masks the middle portion of a credential value,
@@ -907,6 +911,22 @@ func extractKeyGrafanaInfoFromEnv(logger *slog.Logger) (url, apiKey string, auth
 // Gets the Grafana URL from the environment and request-scoped credentials and
 // organization information from HTTP headers, with environment fallbacks.
 func extractKeyGrafanaInfoFromReq(req *http.Request, logger *slog.Logger) (grafanaUrl, apiKey string, auth *url.Userinfo, orgId int64) {
+	// A verified Cloudflare identity is the only credential permitted for this
+	// request. Avoid even loading environment or caller-supplied static
+	// credentials, including in library embeddings which do not use the CLI's
+	// startup validation.
+	if _, ok := cloudflareAccessAssertionFromContext(req.Context()); ok {
+		grafanaUrl = normalizeGrafanaURL(os.Getenv(grafanaURLEnvVar))
+		if grafanaUrl == "" {
+			grafanaUrl = defaultGrafanaURL
+		}
+		orgId = orgIdFromHeaders(req, logger)
+		if orgId == 0 {
+			orgId = orgIdFromEnv(logger)
+		}
+		return grafanaUrl, "", nil, orgId
+	}
+
 	eUrl, eApiKey, eAuth, eOrgId := extractKeyGrafanaInfoFromEnv(logger)
 	username, password, _ := req.BasicAuth()
 
@@ -982,6 +1002,7 @@ var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, re
 	config.OrgID = orgID
 
 	config.ExtraHeaders = mergeHeaders(extraHeadersFromEnv(logger), forwardedHeadersFromRequest(req))
+	applyCloudflareAccessIdentity(ctx, &config)
 	return WithGrafanaConfig(ctx, config)
 }
 

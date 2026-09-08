@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -590,6 +591,85 @@ func (hsc *httpSecurityConfig) addFlags() {
 // secret need not appear in the process arguments.
 const serverAuthTokenEnvVar = "MCP_GRAFANA_SERVER_TOKEN"
 
+const (
+	cloudflareAccessEnabledEnvVar    = "MCP_GRAFANA_CLOUDFLARE_ACCESS_ENABLED"
+	cloudflareAccessTeamDomainEnvVar = "MCP_GRAFANA_CLOUDFLARE_ACCESS_TEAM_DOMAIN"
+	cloudflareAccessAudienceEnvVar   = "MCP_GRAFANA_CLOUDFLARE_ACCESS_AUDIENCE"
+)
+
+func cloudflareAccessConfigFromEnv() (mcpgrafana.CloudflareAccessConfig, bool, error) {
+	rawEnabled := strings.TrimSpace(os.Getenv(cloudflareAccessEnabledEnvVar))
+	if rawEnabled == "" {
+		return mcpgrafana.CloudflareAccessConfig{}, false, nil
+	}
+	enabled, err := strconv.ParseBool(rawEnabled)
+	if err != nil {
+		return mcpgrafana.CloudflareAccessConfig{}, false, fmt.Errorf("invalid %s value %q: expected true or false", cloudflareAccessEnabledEnvVar, rawEnabled)
+	}
+	if !enabled {
+		return mcpgrafana.CloudflareAccessConfig{}, false, nil
+	}
+	return mcpgrafana.CloudflareAccessConfig{
+		TeamDomain: strings.TrimSpace(os.Getenv(cloudflareAccessTeamDomainEnvVar)),
+		Audience:   strings.TrimSpace(os.Getenv(cloudflareAccessAudienceEnvVar)),
+	}, true, nil
+}
+
+func validateCloudflareAccessCredentialIsolation(callerToken string) error {
+	if callerToken != "" {
+		return fmt.Errorf("refusing to start: %s=true cannot be combined with --server-auth-token / %s; Cloudflare Managed OAuth authenticates MCP callers", cloudflareAccessEnabledEnvVar, serverAuthTokenEnvVar)
+	}
+	for _, name := range []string{
+		"GRAFANA_SERVICE_ACCOUNT_TOKEN",
+		"GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE",
+		"GRAFANA_API_KEY",
+		"GRAFANA_USERNAME",
+		"GRAFANA_PASSWORD",
+	} {
+		if strings.TrimSpace(os.Getenv(name)) != "" {
+			return fmt.Errorf("refusing to start: %s=true cannot be combined with %s; user-delegated requests must never fall back to static Grafana credentials", cloudflareAccessEnabledEnvVar, name)
+		}
+	}
+
+	for _, name := range splitAndTrim(os.Getenv("GRAFANA_FORWARD_HEADERS")) {
+		if cloudflareCredentialHeader(name) {
+			return fmt.Errorf("refusing to start: %s=true cannot forward authentication header %s through GRAFANA_FORWARD_HEADERS", cloudflareAccessEnabledEnvVar, name)
+		}
+	}
+	if raw := os.Getenv("GRAFANA_EXTRA_HEADERS"); raw != "" {
+		var headers map[string]string
+		if err := json.Unmarshal([]byte(raw), &headers); err != nil {
+			return fmt.Errorf("refusing to start: invalid GRAFANA_EXTRA_HEADERS while %s=true: %w", cloudflareAccessEnabledEnvVar, err)
+		}
+		for name := range headers {
+			if cloudflareCredentialHeader(name) {
+				return fmt.Errorf("refusing to start: %s=true cannot configure authentication header %s through GRAFANA_EXTRA_HEADERS", cloudflareAccessEnabledEnvVar, name)
+			}
+		}
+	}
+	return nil
+}
+
+func cloudflareCredentialHeader(name string) bool {
+	for _, credentialHeader := range []string{
+		"Authorization",
+		"Cookie",
+		"Cf-Access-Jwt-Assertion",
+		"Cf-Access-Token",
+		"Cf-Access-Client-Id",
+		"Cf-Access-Client-Secret",
+		"X-Grafana-Service-Account-Token",
+		"X-Grafana-API-Key",
+		"X-Access-Token",
+		"X-Grafana-Id",
+	} {
+		if strings.EqualFold(name, credentialHeader) {
+			return true
+		}
+	}
+	return false
+}
+
 // callerAuthConfig configures authentication of *callers* to the HTTP/SSE
 // transports — distinct from the credentials the server uses to reach Grafana.
 // It gates who may invoke the MCP server at all.
@@ -898,14 +978,45 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 	// Resolve the caller-auth token once and surface the auth posture before we
 	// start listening. stdio is a local pipe, so it is exempt.
 	callerToken := ca.resolveToken()
+	cloudflareConfig, cloudflareEnabled, cloudflareConfigErr := cloudflareAccessConfigFromEnv()
+	if cloudflareConfigErr != nil {
+		return cloudflareConfigErr
+	}
+	if cloudflareEnabled && transport != "sse" && transport != "streamable-http" {
+		return fmt.Errorf("%s=true requires the sse or streamable-http transport", cloudflareAccessEnabledEnvVar)
+	}
+	var cloudflareAccessMiddleware func(http.Handler) http.Handler
+	if cloudflareEnabled {
+		if err := validateCloudflareAccessCredentialIsolation(callerToken); err != nil {
+			return err
+		}
+		var middlewareErr error
+		cloudflareAccessMiddleware, middlewareErr = mcpgrafana.NewCloudflareAccessMiddleware(cloudflareConfig, slog.Default())
+		if middlewareErr != nil {
+			return fmt.Errorf("invalid Cloudflare Access configuration: %w", middlewareErr)
+		}
+		slog.Info("Cloudflare Access user authentication enabled",
+			"transport", transport,
+			"team_domain", cloudflareConfig.TeamDomain,
+			"audience_set", cloudflareConfig.Audience != "",
+		)
+	}
 	if transport == "sse" || transport == "streamable-http" {
-		checkCallerAuthPolicy(transport, addr, callerToken, slog.Default())
+		if !cloudflareEnabled {
+			checkCallerAuthPolicy(transport, addr, callerToken, slog.Default())
+		}
 		// With caller auth active, Authorization holds the caller token (stripped
 		// after validation). Forwarding it to Grafana would leak it, so refuse the
 		// contradictory combination.
 		if callerToken != "" && mcpgrafana.ForwardsAuthorizationHeader() {
 			return fmt.Errorf("refusing to start: caller authentication is enabled (--server-auth-token / %s) while GRAFANA_FORWARD_HEADERS forwards the Authorization header. Authorization is reserved for MCP caller authentication and would leak to Grafana. Remove Authorization from GRAFANA_FORWARD_HEADERS, or unset the caller token to run in proxy-forwarding mode", serverAuthTokenEnvVar)
 		}
+	}
+	protectEndpoint := func(h http.Handler) http.Handler {
+		if cloudflareAccessMiddleware != nil {
+			return cloudflareAccessMiddleware(h)
+		}
+		return withCallerAuth(callerToken, h)
 	}
 
 	// Our middleware enforces explicit Host allowlists, including over loopback.
@@ -948,7 +1059,7 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 		if basePath == "" {
 			basePath = "/"
 		}
-		mux.Handle(basePath, withCallerAuth(callerToken, observability.WrapHandler(
+		mux.Handle(basePath, protectEndpoint(observability.WrapHandler(
 			mcpgrafana.ValidateGrafanaURLMiddleware(srv), //nolint:staticcheck // Retained temporarily to reject malformed legacy headers.
 			basePath,
 		)))
@@ -982,7 +1093,7 @@ func run(transport, addr, basePath, endpointPath string, logLevel slog.Level, dt
 		}
 		srv := server.NewStreamableHTTPServer(s, opts...)
 		mux := http.NewServeMux()
-		mux.Handle(endpointPath, withCallerAuth(callerToken, observability.WrapHandler(
+		mux.Handle(endpointPath, protectEndpoint(observability.WrapHandler(
 			mcpgrafana.ValidateGrafanaURLMiddleware(srv), //nolint:staticcheck // Retained temporarily to reject malformed legacy headers.
 			endpointPath,
 		)))

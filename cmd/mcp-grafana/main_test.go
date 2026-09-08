@@ -1118,6 +1118,120 @@ func TestCallerAuthConfigResolveToken(t *testing.T) {
 	})
 }
 
+func clearCloudflareAccessEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		cloudflareAccessEnabledEnvVar,
+		cloudflareAccessTeamDomainEnvVar,
+		cloudflareAccessAudienceEnvVar,
+		serverAuthTokenEnvVar,
+		"GRAFANA_SERVICE_ACCOUNT_TOKEN",
+		"GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE",
+		"GRAFANA_API_KEY",
+		"GRAFANA_USERNAME",
+		"GRAFANA_PASSWORD",
+		"GRAFANA_FORWARD_HEADERS",
+		"GRAFANA_EXTRA_HEADERS",
+	} {
+		t.Setenv(name, "")
+	}
+}
+
+func TestCloudflareAccessConfigFromEnv(t *testing.T) {
+	t.Run("disabled by default", func(t *testing.T) {
+		clearCloudflareAccessEnv(t)
+		cfg, enabled, err := cloudflareAccessConfigFromEnv()
+		require.NoError(t, err)
+		assert.False(t, enabled)
+		assert.Empty(t, cfg.TeamDomain)
+	})
+
+	t.Run("explicit false ignores remaining settings", func(t *testing.T) {
+		clearCloudflareAccessEnv(t)
+		t.Setenv(cloudflareAccessEnabledEnvVar, "false")
+		t.Setenv(cloudflareAccessTeamDomainEnvVar, "not-a-url")
+		_, enabled, err := cloudflareAccessConfigFromEnv()
+		require.NoError(t, err)
+		assert.False(t, enabled)
+	})
+
+	t.Run("enabled configuration is trimmed", func(t *testing.T) {
+		clearCloudflareAccessEnv(t)
+		t.Setenv(cloudflareAccessEnabledEnvVar, " true ")
+		t.Setenv(cloudflareAccessTeamDomainEnvVar, " https://team.cloudflareaccess.com ")
+		t.Setenv(cloudflareAccessAudienceEnvVar, " audience ")
+		cfg, enabled, err := cloudflareAccessConfigFromEnv()
+		require.NoError(t, err)
+		assert.True(t, enabled)
+		assert.Equal(t, "https://team.cloudflareaccess.com", cfg.TeamDomain)
+		assert.Equal(t, "audience", cfg.Audience)
+	})
+
+	t.Run("invalid boolean fails closed", func(t *testing.T) {
+		clearCloudflareAccessEnv(t)
+		t.Setenv(cloudflareAccessEnabledEnvVar, "sometimes")
+		_, _, err := cloudflareAccessConfigFromEnv()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), cloudflareAccessEnabledEnvVar)
+	})
+}
+
+func TestValidateCloudflareAccessCredentialIsolation(t *testing.T) {
+	t.Run("clean user delegated configuration", func(t *testing.T) {
+		clearCloudflareAccessEnv(t)
+		t.Setenv("GRAFANA_EXTRA_HEADERS", `{"X-Tenant":"observability"}`)
+		t.Setenv("GRAFANA_FORWARD_HEADERS", "X-Request-ID")
+		require.NoError(t, validateCloudflareAccessCredentialIsolation(""))
+	})
+
+	t.Run("rejects built in caller token", func(t *testing.T) {
+		clearCloudflareAccessEnv(t)
+		err := validateCloudflareAccessCredentialIsolation("caller-secret")
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "caller-secret")
+	})
+
+	for _, name := range []string{
+		"GRAFANA_SERVICE_ACCOUNT_TOKEN",
+		"GRAFANA_SERVICE_ACCOUNT_TOKEN_FILE",
+		"GRAFANA_API_KEY",
+		"GRAFANA_USERNAME",
+		"GRAFANA_PASSWORD",
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			clearCloudflareAccessEnv(t)
+			t.Setenv(name, "static-secret")
+			err := validateCloudflareAccessCredentialIsolation("")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), name)
+			assert.NotContains(t, err.Error(), "static-secret")
+		})
+	}
+
+	for _, name := range []string{"Authorization", "Cookie", "Cf-Access-Jwt-Assertion", "Cf-Access-Token", "X-Grafana-Service-Account-Token"} {
+		t.Run("rejects forwarded "+name, func(t *testing.T) {
+			clearCloudflareAccessEnv(t)
+			t.Setenv("GRAFANA_FORWARD_HEADERS", name)
+			require.Error(t, validateCloudflareAccessCredentialIsolation(""))
+		})
+		t.Run("rejects extra "+name, func(t *testing.T) {
+			clearCloudflareAccessEnv(t)
+			t.Setenv("GRAFANA_EXTRA_HEADERS", `{"`+name+`":"static-secret"}`)
+			err := validateCloudflareAccessCredentialIsolation("")
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "static-secret")
+		})
+	}
+
+	t.Run("invalid extra headers fail closed without echoing value", func(t *testing.T) {
+		clearCloudflareAccessEnv(t)
+		t.Setenv("GRAFANA_EXTRA_HEADERS", "secret-not-json")
+		err := validateCloudflareAccessCredentialIsolation("")
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "secret-not-json")
+	})
+}
+
 func TestCheckCallerAuthPolicy(t *testing.T) {
 	cases := []struct {
 		name      string

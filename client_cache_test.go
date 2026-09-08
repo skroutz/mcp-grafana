@@ -142,6 +142,32 @@ func TestClientCache_DifferentCredentials(t *testing.T) {
 	assert.Equal(t, numUniqueKeys, g) // 5 unique keys
 }
 
+func TestClientCacheKeySingleflightIdentityDoesNotUseRedactedLogString(t *testing.T) {
+	first := clientCacheKey{
+		url:              "https://grafana.example.com",
+		apiKey:           "first-secret-token",
+		orgID:            1,
+		forwardedHeaders: "Cookie=first-secret-cookie",
+	}
+	second := clientCacheKey{
+		url:              "https://grafana.example.com",
+		apiKey:           "second-secret-token",
+		orgID:            1,
+		forwardedHeaders: "Cookie=second-secret-cookie",
+	}
+
+	// Log strings intentionally reveal only credential presence, so these are
+	// equal. Singleflight identifiers must still distinguish the credentials.
+	assert.Equal(t, first.String(), second.String())
+	assert.NotEqual(t, first.singleflightKey(), second.singleflightKey())
+	for _, secret := range []string{"first-secret-token", "second-secret-token", "first-secret-cookie", "second-secret-cookie"} {
+		assert.NotContains(t, first.String(), secret)
+		assert.NotContains(t, second.String(), secret)
+		assert.NotContains(t, first.singleflightKey(), secret)
+		assert.NotContains(t, second.singleflightKey(), secret)
+	}
+}
+
 func TestCacheKeyFromRequest(t *testing.T) {
 	key1 := cacheKeyFromRequest("http://localhost:3000", "key1", nil, 1, nil)
 	key2 := cacheKeyFromRequest("http://localhost:3000", "key1", nil, 1, nil)
