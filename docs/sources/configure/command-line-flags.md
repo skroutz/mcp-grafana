@@ -50,13 +50,13 @@ The SSE and streamable-http transports can authenticate the **caller** (the MCP 
 
 ### Bind policy
 
-Caller authentication is enforced only when `--server-auth-token` is set. When it isn't, the network transports warn (but still start) on an externally reachable address:
+Caller authentication is enforced when `--server-auth-token` is set or [Cloudflare Access user delegation](../authentication/#delegate-cloudflare-access-user-identity) is enabled. Without either mechanism, the network transports warn (but still start) on an externally reachable address:
 
 | Transport / bind | Behavior |
 | --- | --- |
 | `stdio` | No caller authentication (local pipe). |
 | SSE / streamable-http on a loopback address (`localhost`, `127.0.0.1`, `::1`) | Caller token optional. |
-| SSE / streamable-http on any other address | Starts and logs a **security error** (at the `error` log level, so it isn't suppressed by `--log-level`) unless `--server-auth-token` is set. |
+| SSE / streamable-http on any other address | Starts and logs a **security error** (at the `error` log level, so it isn't suppressed by `--log-level`) unless `--server-auth-token` or Cloudflare Access user delegation is enabled. |
 
 {{< admonition type="note" >}}
 The permissive default preserves backward compatibility for existing deployments (such as the container's `0.0.0.0` bind). A future major release will make an unauthenticated non-loopback bind a startup error. Set `--server-auth-token` now to require caller authentication and prepare for that change.

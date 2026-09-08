@@ -6,6 +6,8 @@ require (
 	connectrpc.com/connect v1.20.0
 	github.com/PaesslerAG/gval v1.2.4
 	github.com/PaesslerAG/jsonpath v0.1.1
+	github.com/coreos/go-oidc/v3 v3.21.0
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/go-openapi/runtime v0.32.2
 	github.com/go-openapi/strfmt v0.27.1
 	github.com/google/uuid v1.6.0

@@ -3,7 +3,9 @@ package mcpgrafana
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
+	"hash"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -22,12 +24,13 @@ const clientCacheMeterName = "mcp-grafana"
 
 // clientCacheKey uniquely identifies a client by its credentials, target, and forwarded headers.
 type clientCacheKey struct {
-	url              string
-	apiKey           string
-	username         string
-	password         string
-	orgID            int64
-	forwardedHeaders string // sorted, serialized forwarded headers for cache differentiation
+	url                   string
+	apiKey                string
+	username              string
+	password              string
+	orgID                 int64
+	cloudflareSubjectHash [sha256.Size]byte
+	forwardedHeaders      string // sorted, serialized forwarded headers for cache differentiation
 }
 
 // cacheKeyFromRequest builds a clientCacheKey from request-derived credentials and forwarded headers.
@@ -42,6 +45,12 @@ func cacheKeyFromRequest(grafanaURL, apiKey string, basicAuth *url.Userinfo, org
 		key.password, _ = basicAuth.Password()
 	}
 	if req != nil {
+		if subject, ok := cloudflareAccessSubjectFromContext(req.Context()); ok {
+			// Isolate cached clients per user without retaining or logging the
+			// subject itself. The assertion is deliberately excluded so routine
+			// token refreshes do not create unbounded cache entries.
+			key.cloudflareSubjectHash = sha256.Sum256([]byte(subject))
+		}
 		headers := forwardedHeadersFromRequest(req)
 		if len(headers) > 0 {
 			names := make([]string, 0, len(headers))
@@ -66,7 +75,33 @@ func cacheKeyFromRequest(grafanaURL, apiKey string, basicAuth *url.Userinfo, org
 func (k clientCacheKey) String() string {
 	hasKey := k.apiKey != ""
 	hasBasic := k.username != ""
-	return fmt.Sprintf("url=%s apiKey=%t basicAuth=%t orgID=%d forwardedHeaders=%s", k.url, hasKey, hasBasic, k.orgID, k.forwardedHeaders)
+	hasCloudflareUser := k.cloudflareSubjectHash != [sha256.Size]byte{}
+	return fmt.Sprintf("url=%s apiKey=%t basicAuth=%t orgID=%d cloudflareUser=%t forwardedHeaders=%t", k.url, hasKey, hasBasic, k.orgID, hasCloudflareUser, k.forwardedHeaders != "")
+}
+
+// singleflightKey returns a collision-resistant, non-reversible identifier for
+// the complete cache key. Using fmt.Sprintf("%v", key) would invoke String(),
+// whose intentionally redacted output makes different users and credentials
+// collide during concurrent client creation.
+func (k clientCacheKey) singleflightKey() string {
+	h := sha256.New()
+	writeCacheHashField(h, k.url)
+	writeCacheHashField(h, k.apiKey)
+	writeCacheHashField(h, k.username)
+	writeCacheHashField(h, k.password)
+	var orgID [8]byte
+	binary.BigEndian.PutUint64(orgID[:], uint64(k.orgID))
+	_, _ = h.Write(orgID[:])
+	_, _ = h.Write(k.cloudflareSubjectHash[:])
+	writeCacheHashField(h, k.forwardedHeaders)
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func writeCacheHashField(h hash.Hash, value string) {
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+	_, _ = h.Write(size[:])
+	_, _ = h.Write([]byte(value))
 }
 
 // clientCacheMetrics holds OTel instruments for cache observability.
@@ -187,10 +222,8 @@ func (c *ClientCache) GetOrCreateGrafanaClient(key clientCacheKey, createFn func
 	c.mu.RUnlock()
 
 	// Slow path: use singleflight to create outside the lock,
-	// deduplicating concurrent requests for the same key.
-	// Use fmt.Sprintf("%v", key) for the singleflight key to include actual
-	// credential values (the struct fields), not the redacted String() output.
-	sfKey := fmt.Sprintf("%v", key)
+	// deduplicating concurrent requests for the same complete key.
+	sfKey := key.singleflightKey()
 	val, _, _ := c.sfGrafana.Do(sfKey, func() (any, error) {
 		// Double-check after winning the singleflight race
 		c.mu.RLock()
@@ -236,7 +269,7 @@ func (c *ClientCache) GetOrCreateIncidentClient(key clientCacheKey, createFn fun
 	c.mu.RUnlock()
 
 	// Slow path: use singleflight to create outside the lock
-	sfKey := fmt.Sprintf("%v", key)
+	sfKey := key.singleflightKey()
 	val, _, _ := c.sfIncident.Do(sfKey, func() (any, error) {
 		c.mu.RLock()
 		if client, ok := c.incidentClients[key]; ok {
@@ -280,7 +313,7 @@ func (c *ClientCache) GetOrCreateK8sClient(key clientCacheKey, createFn func() *
 	c.mu.RUnlock()
 
 	// Slow path: use singleflight to create outside the lock
-	sfKey := fmt.Sprintf("%v", key)
+	sfKey := key.singleflightKey()
 	val, _, _ := c.sfK8s.Do(sfKey, func() (any, error) {
 		c.mu.RLock()
 		if client, ok := c.k8sClients[key]; ok {

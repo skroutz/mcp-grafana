@@ -450,7 +450,7 @@ Optionally require MCP clients to authenticate *to the server*. This is separate
 
 - `--server-auth-token`: Bearer token callers must send as `Authorization: Bearer <token>`. Falls back to the `MCP_GRAFANA_SERVER_TOKEN` environment variable. When set, requests without a valid token are rejected with `401` before any tool runs. Prefer the env var so the secret isn't visible in the process arguments.
 
-Caller authentication is enforced only when `--server-auth-token` is set. When it isn't and the server binds a non-loopback address, the server **starts but logs a security error** — emitted at the `error` log level so it isn't hidden by `--log-level` (loopback and stdio are unaffected); a future major release will make that a startup error. Use TLS (or TLS termination) whenever caller auth is enabled on a non-loopback address. When caller auth is enabled, the validated `Authorization` header is stripped before requests reach Grafana; combining `--server-auth-token` with `GRAFANA_FORWARD_HEADERS=Authorization` is rejected at startup.
+Caller authentication is enforced when `--server-auth-token` is set or [Cloudflare Access per-user authentication](#cloudflare-access-per-user-authentication-ssestreamable-http-only) is enabled. Without either mechanism, a non-loopback server **starts but logs a security error** — emitted at the `error` log level so it isn't hidden by `--log-level` (loopback and stdio are unaffected); a future major release will make that a startup error. Use TLS (or TLS termination) whenever caller auth is enabled on a non-loopback address. When static caller authentication is enabled, the validated `Authorization` header is stripped before requests reach Grafana; combining `--server-auth-token` with `GRAFANA_FORWARD_HEADERS=Authorization` is rejected at startup.
 
 **Debug and Logging:**
 - `--debug`: Enable debug mode for detailed HTTP request/response logging
@@ -780,6 +780,22 @@ GRAFANA_FORWARD_HEADERS=Cookie,X-Session-Id
 Forwarded headers are merged with any headers defined in `GRAFANA_EXTRA_HEADERS`. If a header name appears in both, the value from the incoming request takes precedence for that request.
 
 Trace context headers (`traceparent`, `tracestate`, `baggage`) are the exception: the server propagates trace context itself, so a forwarded value never overrides the one it injects. See [observability](docs/sources/developer/observability-metrics-and-tracing.md#trace-context-propagation).
+
+### Cloudflare Access Per-User Authentication (SSE/Streamable-HTTP Only)
+
+Remote employee-facing deployments can use Cloudflare Access Managed OAuth and Linked App Tokens so every Grafana request runs with the signed-in user's identity and Grafana RBAC permissions. Users only configure the MCP URL: their MCP client opens the existing browser SSO flow and handles refresh automatically.
+
+```bash
+GRAFANA_URL=https://grafana.example.com
+MCP_GRAFANA_CLOUDFLARE_ACCESS_ENABLED=true
+MCP_GRAFANA_CLOUDFLARE_ACCESS_TEAM_DOMAIN=https://example.cloudflareaccess.com
+MCP_GRAFANA_CLOUDFLARE_ACCESS_AUDIENCE=<MCP_APPLICATION_AUD_TAG>
+mcp-grafana --transport streamable-http --address 0.0.0.0:8000 --allowed-hosts mcp.example.com
+```
+
+Protect the MCP endpoint with a Cloudflare Access self-hosted application using Managed OAuth. On the Access application protecting Grafana, add a Service Auth / Linked App Token policy that trusts the MCP application. `mcp-grafana` validates Cloudflare's MCP-audience assertion, rejects service-token identities, strips the client OAuth bearer and caller-supplied credentials, and forwards only the verified assertion as `Cf-Access-Token`.
+
+This mode is intentionally incompatible with `MCP_GRAFANA_SERVER_TOKEN`, Grafana service account/API tokens, basic auth, and forwarding static authentication headers. These combinations fail at startup rather than falling back to a shared privileged identity. Existing authentication behavior is unchanged while `MCP_GRAFANA_CLOUDFLARE_ACCESS_ENABLED` is unset or `false`; use a separate deployment for machine automation. See [Authentication](docs/sources/configure/authentication.md#delegate-cloudflare-access-user-identity) for the Cloudflare setup and security requirements.
 
 2. You have several options to install `mcp-grafana`:
 
